@@ -3,12 +3,12 @@ import random
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 
-from model import (
+from app.model import (
     Courier,
     Order,
     OrderGroup
 )
-from database import (
+from app.database import (
     fetch_one,
     fetch_all,
     create_one,
@@ -111,9 +111,30 @@ async def create_courier(courier: Courier):
     return courier
 
 
+@app.get("/couriers/{courier_id}/orders", response_model=list[Order])
+async def get_courier_orders(courier_id: int):
+    items = []
+    orders = db["orders"].find({"courier_id": courier_id})
+    async for document in orders:
+        items.append(Order(**document))
+    return items
+
+
+@app.get("/couriers/{courier_id}/", response_model=Courier)
+async def get_courier(courier_id: int):
+    courier = await fetch_one("couriers", courier_id)
+    return courier
+
+
 @app.get("/orders", response_model=list[Order])
 async def get_orders():
     orders = await fetch_all("orders", Order)
+    return orders
+
+
+@app.get("/order_groups", response_model=list[OrderGroup])
+async def get_orders():
+    orders = await fetch_all("order_groups", OrderGroup)
     return orders
 
 
@@ -123,39 +144,56 @@ async def create_order(order: Order):
     return order
 
 
-@app.get("/optimize_orders")
-async def optimize_orders():
+@app.post("/optimize_orders")
+async def optimize_orders(num_groups: int):
     orders = await fetch_all("orders", Order)
     try:
-        groups = group_delivery_points([order.dict() for order in orders if order.state != "processing"], 3, 1000)
+        groups = group_delivery_points([order.dict() for order in orders if order.state != "processing"], num_groups, 1000)
         for l in groups:
             for d in l:
                 d.update((k, "processing") for k, v in d.items() if v == "new")
                 new_state = await update_order_status("processing", d["location"])
-                print(new_state)
         orders = [await create_one("order_groups", OrderGroup(courier_id=None, orders=group, state="processing").dict()) for group in groups]
     except Exception as e:
-        raise HTTPException(404, f"нету новых заказов")
+        raise HTTPException(404, f"нету новых заказов {e}")
     return groups
 
 
 @app.get("/assign_couriers")
 async def assign_couriers():
+    couriers_list = []
     couriers = db["couriers"].find({"available": True})
     orders = await db["order_groups"].find({"courier_id": None}).to_list(None)
     i = 0
     try:
         async for courier in couriers:
-            new_courier = await update_one("couriers", courier["courier_id"], "available", False)
-            new_courier = await update_one("couriers", courier["courier_id"], "orders", orders[i]["orders"])
-            print(new_courier)
-            new_order = await db["order_groups"].update_one({"_id": orders[i]['_id']}, {"$set": {"courier_id": courier["courier_id"]}})
+            new_orders = []
+            for order in orders[i]["orders"]:
+                new_order = await db["orders"].update_one({"location": order["location"]}, {"$set": {"state": "assigned", "courier_id": courier["courier_id"]}})
+                new_order = await db["orders"].find_one({"location": order["location"]})
+                new_orders.append(new_order)
+            new_courier = await db["couriers"].update_one({"courier_id": courier["courier_id"]}, {"$set": {"available": False, "orders": new_orders}})
+            new_order_group = await db["order_groups"].update_one({"_id": orders[i]['_id']}, {"$set": {"courier_id": courier["courier_id"], "state": "assigned", "orders": new_orders}})
+            couriers_list.append(new_courier.raw_result)
             i += 1
     except Exception as e:
-        raise HTTPException(404, f"нету курьеров или заказов чё")
+        raise HTTPException(404, f"нету курьеров или заказов чё, {e}")
+    return "Заказы распределены"
 
 
 @app.get("/reset_orders")
 async def reset_orders():
-    orders = await db["orders"].update_many({}, {"$set": {"state": "new"}})
-    return orders
+    orders = await db["orders"].update_many({}, {"$set": {"state": "new", "courier_id": None}})
+    return "Заказы обновлены"
+
+
+@app.get("/reset_couriers")
+async def reset_couriers():
+    courier = await db["couriers"].update_many({}, {"$set": {"available": True, "orders": []}})
+    return "курьеры обновлены"
+
+
+@app.get("/reset_order_groups")
+async def reset_order_groups():
+    order_groups = await db["order_groups"].drop()
+    return "группы заказов обновлены"
